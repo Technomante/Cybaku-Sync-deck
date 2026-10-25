@@ -209,6 +209,26 @@ kbd{background:var(--ground);border:1px solid var(--rule-2);border-radius:2px;pa
 .banner.hide{display:none}
 .banner strong{font-family:var(--cond);font-size:14px;letter-spacing:.06em;color:var(--break);display:block;margin-bottom:2px}
 
+/* ---------- transcript sync ---------- */
+.tsync{
+  position:fixed;right:12px;top:46px;z-index:25;width:min(380px,calc(100vw - 24px));
+  background:var(--panel-2);border:1px solid var(--rule-2);border-radius:2px;padding:14px 16px;
+  box-shadow:0 14px 40px rgba(0,0,0,.6);display:flex;flex-direction:column;gap:8px;
+}
+.tsync.hide{display:none}
+.tsync h2{font-family:var(--cond);font-size:14px;letter-spacing:.1em;margin:0;color:var(--dim)}
+.tsync p{margin:0;font-size:12.5px;color:var(--dim);line-height:1.5}
+.tsync textarea{
+  width:100%;height:92px;resize:vertical;background:var(--ground);border:1px solid var(--rule-2);
+  border-radius:2px;padding:6px 10px;color:var(--ink);font-size:12px;font-family:var(--sans);
+}
+.tsync textarea::placeholder{color:#454C5B}
+.tsync textarea:focus{border-color:var(--pip);outline:none}
+.tsync .row{display:flex;align-items:center;gap:10px}
+#trMsg{font-size:12.5px;color:var(--dim);line-height:1.4}
+#trMsg[data-ok="1"]{color:var(--b)}
+#trMsg[data-ok="0"]{color:var(--break)}
+
 @media (max-width:900px){
   .stage{flex-direction:column}
   .divider{width:auto;height:1px;align-self:stretch;margin:5px 0}
@@ -226,6 +246,7 @@ kbd{background:var(--ground);border:1px solid var(--rule-2);border-radius:2px;pa
   <header class="bar-top">
     <h1 class="wordmark">SYNC<span class="slash">/</span>DECK</h1>
     <span class="grow"></span>
+    <button class="ghost" id="tsyncToggle" aria-expanded="false" aria-controls="tsyncPop" title="Find the offset from the two transcripts">AUTO-SYNC</button>
     <button class="ghost" id="srcToggle" aria-expanded="true" aria-controls="sources">SOURCES</button>
     <button class="ghost round" id="helpToggle" aria-label="Keyboard shortcuts">?</button>
   </header>
@@ -306,6 +327,19 @@ kbd{background:var(--ground);border:1px solid var(--rule-2);border-radius:2px;pa
       <option value="2">2×</option>
     </select>
   </footer>
+</div>
+
+<div class="tsync hide" id="tsyncPop">
+  <h2>TRANSCRIPT SYNC</h2>
+  <p>On each video: open the description, click “Show transcript”, then select and copy the first few minutes.</p>
+  <textarea id="trA" style="--pip:var(--a)" spellcheck="false" aria-label="Transcript of deck A"
+            placeholder="Deck A transcript (with timestamps)"></textarea>
+  <textarea id="trB" style="--pip:var(--b)" spellcheck="false" aria-label="Transcript of deck B"
+            placeholder="Deck B transcript (with timestamps)"></textarea>
+  <div class="row">
+    <button class="load-btn" id="trGo">MATCH &amp; APPLY</button>
+    <span id="trMsg" role="status"></span>
+  </div>
 </div>
 
 <div class="help hide" id="helpPop">
@@ -1118,6 +1152,101 @@ kbd{background:var(--ground);border:1px solid var(--rule-2);border-radius:2px;pa
   }
 
   /* ============================================================
+     Transcript match — rough offset from two pasted transcripts
+     ============================================================ */
+  const trPop = $('tsyncPop'), trToggle = $('tsyncToggle'), trMsg = $('trMsg');
+
+  // YouTube's "Show transcript" copies as a timestamp line ("0:12") followed
+  // by the words; "0:12 words" on one line works too.
+  function parseTranscript(raw) {
+    const re = /^\s*\[?(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[.,]\d{1,3})?\]?\s*(.*)$/;
+    const cues = [];
+    String(raw || '').split(/\r?\n/).forEach(function (line) {
+      const m = line.match(re);
+      if (m) cues.push({ t: (+m[1] || 0) * 3600 + (+m[2]) * 60 + (+m[3]), text: m[4] || '' });
+      else if (cues.length) cues[cues.length - 1].text += ' ' + line;
+    });
+    return cues;
+  }
+
+  function normWords(s) {
+    return s.toLowerCase().replace(/\[[^\]]*\]|\([^)]*\)/g, ' ').replace(/['\u2019]/g, '')
+      .split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  }
+
+  // Timestamps are whole seconds and the two videos split their lines
+  // differently, so each word gets its own time, spread across its line.
+  function timedWords(cues) {
+    const out = [];
+    cues.forEach(function (c, i) {
+      const w = normWords(c.text);
+      if (!w.length) return;
+      const next = i + 1 < cues.length ? cues[i + 1].t : c.t + 3;
+      const span = clamp(next - c.t, 1, 8);
+      w.forEach(function (x, k) { out.push({ w: x, t: c.t + ((k + 0.5) / w.length) * span }); });
+    });
+    return out;
+  }
+
+  // Three-word phrases -> the times they are spoken at.
+  function phraseIndex(words) {
+    const idx = new Map();
+    for (let i = 0; i + 3 <= words.length; i++) {
+      const k = words[i].w + ' ' + words[i + 1].w + ' ' + words[i + 2].w;
+      const arr = idx.get(k);
+      if (arr) arr.push(words[i].t); else idx.set(k, [words[i].t]);
+    }
+    return idx;
+  }
+
+  // Every phrase both videos share votes for a gap (time in B minus time in
+  // A). Wrong matches scatter; the true gap piles up. Take the biggest pile.
+  function findOffset(rawA, rawB) {
+    const ia = phraseIndex(timedWords(parseTranscript(rawA)));
+    const ib = phraseIndex(timedWords(parseTranscript(rawB)));
+    const diffs = [];
+    ia.forEach(function (ta, k) {
+      const tb = ib.get(k);
+      if (!tb || ta.length > 6 || tb.length > 6) return;   // skip filler phrases said again and again
+      ta.forEach(function (a) { tb.forEach(function (b) { diffs.push(b - a); }); });
+    });
+    if (!diffs.length) return { total: 0, count: 0, offset: 0 };
+
+    const bins = new Map();
+    diffs.forEach(function (d) {
+      const k = Math.round(d / 0.5);
+      bins.set(k, (bins.get(k) || 0) + 1);
+    });
+    let bestK = 0, bestScore = -1;
+    bins.forEach(function (n, k) {
+      const s = (bins.get(k - 1) || 0) + n + (bins.get(k + 1) || 0);
+      if (s > bestScore) { bestScore = s; bestK = k; }
+    });
+    const near = diffs.filter(function (d) { return Math.abs(d - bestK * 0.5) <= 1; })
+      .sort(function (x, y) { return x - y; });
+    return { total: diffs.length, count: near.length, offset: near[near.length >> 1] };
+  }
+
+  function runMatch() {
+    const r = findOffset($('trA').value, $('trB').value);
+    if (!r.total) {
+      trMsg.dataset.ok = '0';
+      trMsg.textContent = 'No shared phrases found. Check that both boxes hold transcript text with timestamps.';
+      return;
+    }
+    if (r.count < 5 || r.count < r.total * 0.15) {
+      trMsg.dataset.ok = '0';
+      trMsg.textContent = 'No clear match (' + r.count + ' of ' + r.total + ' shared phrases agree). Paste a longer stretch of each transcript.';
+      return;
+    }
+    const v = Math.round(r.offset * 10) / 10;
+    if (!S.linked && bothReady()) relink(v); else setOffset(v);
+    trMsg.dataset.ok = '1';
+    trMsg.textContent = 'Offset set to ' + (v > 0 ? '+' : '') + v.toFixed(1) + ' s (' + r.count +
+      ' phrases agree). Press play and fine-tune with the +/\u2212 buttons.';
+  }
+
+  /* ============================================================
      Sources panel
      ============================================================ */
   function setSources(open) {
@@ -1155,6 +1284,11 @@ kbd{background:var(--ground);border:1px solid var(--rule-2);border-radius:2px;pa
      Wiring
      ============================================================ */
   el.loadBtn.addEventListener('click', loadBoth);
+  trToggle.addEventListener('click', function () {
+    const open = trPop.classList.toggle('hide') === false;
+    trToggle.setAttribute('aria-expanded', String(open));
+  });
+  $('trGo').addEventListener('click', runMatch);
   [el.urlA, el.urlB].forEach(function (i) {
     i.addEventListener('keydown', function (e) { if (e.key === 'Enter') loadBoth(); });
   });
